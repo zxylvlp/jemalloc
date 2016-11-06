@@ -1,3 +1,5 @@
+.project
+.cproject
 /*.gcov.*
 
 /bin/jemalloc-config

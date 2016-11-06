@@ -5,7 +5,7 @@
 /* Data. */
 
 /* Runtime configuration options. */
-const char	*je_malloc_conf JEMALLOC_ATTR(weak);
+const char	*je_malloc_conf JEMALLOC_ATTR(weak); // 定义je_malloc_conf字符指针弱符号
 bool	opt_abort =
 #ifdef JEMALLOC_DEBUG
     true
