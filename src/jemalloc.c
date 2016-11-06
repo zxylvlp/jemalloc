@@ -5,7 +5,11 @@
 /* Data. */
 
 /* Runtime configuration options. */
-const char	*je_malloc_conf JEMALLOC_ATTR(weak); // 定义je_malloc_conf字符指针弱符号
+const char	*je_malloc_conf
+#ifndef _WIN32
+    JEMALLOC_ATTR(weak) // 定义je_malloc_conf字符指针弱符号
+#endif
+    ;
 bool	opt_abort =
 #ifdef JEMALLOC_DEBUG
     true
@@ -79,7 +83,7 @@ enum {
 static uint8_t	malloc_slow_flags;
 
 JEMALLOC_ALIGNED(CACHELINE)
-const size_t	pind2sz_tab[NPSIZES] = {
+const size_t	pind2sz_tab[NPSIZES+1] = {
 #define	PSZ_yes(lg_grp, ndelta, lg_delta)				\
 	(((ZU(1)<<lg_grp) + (ZU(ndelta)<<lg_delta))),
 #define	PSZ_no(lg_grp, ndelta, lg_delta)
@@ -89,6 +93,7 @@ const size_t	pind2sz_tab[NPSIZES] = {
 #undef PSZ_yes
 #undef PSZ_no
 #undef SC
+	(LARGE_MAXCLASS + PAGE)
 };
 
 JEMALLOC_ALIGNED(CACHELINE)
@@ -749,6 +754,20 @@ malloc_ncpus(void)
 	SYSTEM_INFO si;
 	GetSystemInfo(&si);
 	result = si.dwNumberOfProcessors;
+#elif defined(JEMALLOC_GLIBC_MALLOC_HOOK) && defined(CPU_COUNT)
+	/*
+	 * glibc >= 2.6 has the CPU_COUNT macro.
+	 *
+	 * glibc's sysconf() uses isspace().  glibc allocates for the first time
+	 * *before* setting up the isspace tables.  Therefore we need a
+	 * different method to get the number of CPUs.
+	 */
+	{
+		cpu_set_t set;
+
+		pthread_getaffinity_np(pthread_self(), sizeof(set), &set);
+		result = CPU_COUNT(&set);
+	}
 #else
 	result = sysconf(_SC_NPROCESSORS_ONLN);
 #endif
@@ -1882,6 +1901,29 @@ JEMALLOC_EXPORT void *(*__realloc_hook)(void *ptr, size_t size) = je_realloc;
 JEMALLOC_EXPORT void *(*__memalign_hook)(size_t alignment, size_t size) =
     je_memalign;
 # endif
+
+#ifdef CPU_COUNT
+/*
+ * To enable static linking with glibc, the libc specific malloc interface must
+ * be implemented also, so none of glibc's malloc.o functions are added to the
+ * link.
+ */
+#define	ALIAS(je_fn)	__attribute__((alias (#je_fn), used))
+/* To force macro expansion of je_ prefix before stringification. */
+#define	PREALIAS(je_fn)  ALIAS(je_fn)
+void	*__libc_malloc(size_t size) PREALIAS(je_malloc);
+void	__libc_free(void* ptr) PREALIAS(je_free);
+void	*__libc_realloc(void* ptr, size_t size) PREALIAS(je_realloc);
+void	*__libc_calloc(size_t n, size_t size) PREALIAS(je_calloc);
+void	*__libc_memalign(size_t align, size_t s) PREALIAS(je_memalign);
+void	*__libc_valloc(size_t size) PREALIAS(je_valloc);
+int	__posix_memalign(void** r, size_t a, size_t s)
+    PREALIAS(je_posix_memalign);
+#undef PREALIAS
+#undef ALIAS
+
+#endif
+
 #endif
 
 /*

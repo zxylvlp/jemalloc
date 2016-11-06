@@ -45,7 +45,7 @@ static size_t	highpages;
  */
 
 static void	extent_record(tsdn_t *tsdn, arena_t *arena,
-    extent_hooks_t **r_extent_hooks, extent_heap_t extent_heaps[NPSIZES],
+    extent_hooks_t **r_extent_hooks, extent_heap_t extent_heaps[NPSIZES+1],
     bool cache, extent_t *extent);
 
 /******************************************************************************/
@@ -190,11 +190,11 @@ extent_ad_comp(const extent_t *a, const extent_t *b)
 ph_gen(, extent_heap_, extent_heap_t, extent_t, ph_link, extent_ad_comp)
 
 static void
-extent_heaps_insert(tsdn_t *tsdn, extent_heap_t extent_heaps[NPSIZES],
+extent_heaps_insert(tsdn_t *tsdn, extent_heap_t extent_heaps[NPSIZES+1],
     extent_t *extent)
 {
 	size_t psz = extent_size_quantize_floor(extent_size_get(extent));
-	pszind_t pind = psz2ind_clamp(psz);
+	pszind_t pind = psz2ind(psz);
 
 	malloc_mutex_assert_owner(tsdn, &extent_arena_get(extent)->extents_mtx);
 
@@ -202,11 +202,11 @@ extent_heaps_insert(tsdn_t *tsdn, extent_heap_t extent_heaps[NPSIZES],
 }
 
 static void
-extent_heaps_remove(tsdn_t *tsdn, extent_heap_t extent_heaps[NPSIZES],
+extent_heaps_remove(tsdn_t *tsdn, extent_heap_t extent_heaps[NPSIZES+1],
     extent_t *extent)
 {
 	size_t psz = extent_size_quantize_floor(extent_size_get(extent));
-	pszind_t pind = psz2ind_clamp(psz);
+	pszind_t pind = psz2ind(psz);
 
 	malloc_mutex_assert_owner(tsdn, &extent_arena_get(extent)->extents_mtx);
 
@@ -229,8 +229,10 @@ extent_rtree_acquire(tsdn_t *tsdn, rtree_ctx_t *rtree_ctx,
 		*r_elm_b = rtree_elm_acquire(tsdn, &extents_rtree, rtree_ctx,
 		    (uintptr_t)extent_last_get(extent), dependent,
 		    init_missing);
-		if (!dependent && *r_elm_b == NULL)
+		if (!dependent && *r_elm_b == NULL) {
+			rtree_elm_release(tsdn, &extents_rtree, *r_elm_a);
 			return (true);
+		}
 		assert(*r_elm_b != NULL);
 	} else
 		*r_elm_b = NULL;
@@ -356,15 +358,14 @@ extent_deregister(tsdn_t *tsdn, extent_t *extent)
  */
 static extent_t *
 extent_first_best_fit(tsdn_t *tsdn, arena_t *arena,
-    extent_heap_t extent_heaps[NPSIZES], size_t size)
+    extent_heap_t extent_heaps[NPSIZES+1], size_t size)
 {
 	pszind_t pind, i;
 
 	malloc_mutex_assert_owner(tsdn, &arena->extents_mtx);
 
 	pind = psz2ind(extent_size_quantize_ceil(size));
-	assert(pind < NPSIZES);
-	for (i = pind; i < NPSIZES; i++) {
+	for (i = pind; i < NPSIZES+1; i++) {
 		extent_t *extent = extent_heap_first(&extent_heaps[i]);
 		if (extent != NULL)
 			return (extent);
@@ -391,7 +392,7 @@ extent_leak(tsdn_t *tsdn, arena_t *arena, extent_hooks_t **r_extent_hooks,
 
 static extent_t *
 extent_recycle(tsdn_t *tsdn, arena_t *arena, extent_hooks_t **r_extent_hooks,
-    extent_heap_t extent_heaps[NPSIZES], bool locked, bool cache,
+    extent_heap_t extent_heaps[NPSIZES+1], bool locked, bool cache,
     void *new_addr, size_t usize, size_t pad, size_t alignment, bool *zero,
     bool *commit, bool slab)
 {
@@ -404,6 +405,7 @@ extent_recycle(tsdn_t *tsdn, arena_t *arena, extent_hooks_t **r_extent_hooks,
 		malloc_mutex_assert_owner(tsdn, &arena->extents_mtx);
 	assert(new_addr == NULL || !slab);
 	assert(pad == 0 || !slab);
+	assert(alignment > 0);
 	if (config_debug && new_addr != NULL) {
 		extent_t *prev;
 
@@ -427,8 +429,7 @@ extent_recycle(tsdn_t *tsdn, arena_t *arena, extent_hooks_t **r_extent_hooks,
 	}
 
 	size = usize + pad;
-	alloc_size = (new_addr != NULL) ? size : s2u(size +
-	    PAGE_CEILING(alignment) - PAGE);
+	alloc_size = size + PAGE_CEILING(alignment) - PAGE;
 	/* Beware size_t wrap-around. */
 	if (alloc_size < usize)
 		return (NULL);
@@ -515,8 +516,9 @@ extent_recycle(tsdn_t *tsdn, arena_t *arena, extent_hooks_t **r_extent_hooks,
 		extent_usize_set(extent, usize);
 	}
 
-	if (!extent_committed_get(extent) && extent_commit_wrapper(tsdn, arena,
-	    r_extent_hooks, extent, 0, extent_size_get(extent))) {
+	if (commit && !extent_committed_get(extent) &&
+	    extent_commit_wrapper(tsdn, arena, r_extent_hooks, extent, 0,
+	    extent_size_get(extent))) {
 		if (!locked)
 			malloc_mutex_unlock(tsdn, &arena->extents_mtx);
 		extent_record(tsdn, arena, r_extent_hooks, extent_heaps, cache,
@@ -588,44 +590,41 @@ extent_alloc_core(tsdn_t *tsdn, arena_t *arena, void *new_addr, size_t size,
 static extent_t *
 extent_alloc_cache_impl(tsdn_t *tsdn, arena_t *arena,
     extent_hooks_t **r_extent_hooks, bool locked, void *new_addr, size_t usize,
-    size_t pad, size_t alignment, bool *zero, bool slab)
+    size_t pad, size_t alignment, bool *zero, bool *commit, bool slab)
 {
 	extent_t *extent;
-	bool commit;
 
 	assert(usize + pad != 0);
 	assert(alignment != 0);
 
-	commit = true;
 	extent = extent_recycle(tsdn, arena, r_extent_hooks,
 	    arena->extents_cached, locked, true, new_addr, usize, pad,
-	    alignment, zero, &commit, slab);
+	    alignment, zero, commit, slab);
 	if (extent == NULL)
 		return (NULL);
-	assert(commit);
 	return (extent);
 }
 
 extent_t *
 extent_alloc_cache_locked(tsdn_t *tsdn, arena_t *arena,
     extent_hooks_t **r_extent_hooks, void *new_addr, size_t usize, size_t pad,
-    size_t alignment, bool *zero, bool slab)
+    size_t alignment, bool *zero, bool *commit, bool slab)
 {
 
 	malloc_mutex_assert_owner(tsdn, &arena->extents_mtx);
 
 	return (extent_alloc_cache_impl(tsdn, arena, r_extent_hooks, true,
-	    new_addr, usize, pad, alignment, zero, slab));
+	    new_addr, usize, pad, alignment, zero, commit, slab));
 }
 
 extent_t *
 extent_alloc_cache(tsdn_t *tsdn, arena_t *arena,
     extent_hooks_t **r_extent_hooks, void *new_addr, size_t usize, size_t pad,
-    size_t alignment, bool *zero, bool slab)
+    size_t alignment, bool *zero, bool *commit, bool slab)
 {
 
 	return (extent_alloc_cache_impl(tsdn, arena, r_extent_hooks, false,
-	    new_addr, usize, pad, alignment, zero, slab));
+	    new_addr, usize, pad, alignment, zero, commit, slab));
 }
 
 static void *
@@ -758,7 +757,7 @@ extent_can_coalesce(const extent_t *a, const extent_t *b)
 static void
 extent_try_coalesce(tsdn_t *tsdn, arena_t *arena,
     extent_hooks_t **r_extent_hooks, extent_t *a, extent_t *b,
-    extent_heap_t extent_heaps[NPSIZES], bool cache)
+    extent_heap_t extent_heaps[NPSIZES+1], bool cache)
 {
 
 	if (!extent_can_coalesce(a, b))
@@ -786,7 +785,7 @@ extent_try_coalesce(tsdn_t *tsdn, arena_t *arena,
 
 static void
 extent_record(tsdn_t *tsdn, arena_t *arena, extent_hooks_t **r_extent_hooks,
-    extent_heap_t extent_heaps[NPSIZES], bool cache, extent_t *extent)
+    extent_heap_t extent_heaps[NPSIZES+1], bool cache, extent_t *extent)
 {
 	extent_t *prev, *next;
 	rtree_ctx_t rtree_ctx_fallback;
